@@ -1,0 +1,361 @@
+from datetime import datetime, timedelta
+# The DAG object; we'll need this to instantiate a DAG
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators import BashOperator
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.python_operator import BranchPythonOperator,PythonOperator
+from airflow.operators.dagrun_operator import TriggerDagRunOperator
+import logging
+from contextlib import contextmanager
+from airflow.contrib.hooks.bigquery_hook import BigQueryHook
+from airflow.hooks.mysql_hook import MySqlHook
+from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
+from airflow.exceptions import AirflowException
+from operators.sensors import IngestionSqlSensor
+
+# These args will get passed on to each operator
+# You can override them on a per-task basis during operator initialization
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'start_date':datetime(2022, 3, 21),
+    'email': ['airflow@example.com'],
+    'email_on_failure': False,
+    'email_on_retry': False,
+    'project':'vf-grp-vrsbi-live'
+}
+
+
+def Convert(file_list_string):
+    li = list(file_list_string.split(","))
+    return li
+
+project_id = Variable.get('bq_datahub_project_id')
+database_name='vfvrs_dh_lake_bi_syniverse_processed_s'
+landing_db_name='vfvrs_dh_lake_bi_syniverse_rawprepared_s'
+is_manual=Variable.get('manual_run').strip()
+source_system=Variable.get('source_system').strip()
+
+if str(is_manual)=='true' and str(source_system) == 'syniverse':
+    manual_run_file_list = Variable.get('manual_run_files').strip()
+    if (manual_run_file_list.find(',') != -1):
+        syn_file_list = Convert(manual_run_file_list)
+    else:
+        syn_file_list=str(manual_run_file_list)
+else:
+    auto_file_list = Variable.get('syniverse_files').strip()
+    syn_file_list = Convert(auto_file_list)
+
+@contextmanager
+def bq_cursor():
+    conn = BigQueryHook(bigquery_conn_id='bigquery_default',use_legacy_sql=False).get_conn()
+    try:
+        yield conn.cursor()
+    finally:
+        conn.close()
+
+@contextmanager
+def db_cursor():
+    conn = MySqlHook(mysql_conn_id="airflow_db").get_conn()
+    try:
+        yield conn.cursor()
+    finally:
+        conn.close()
+
+
+def fetch_date(**kwargs):
+    task_instance = kwargs['ti']
+    if str(is_manual) == 'true' and str(source_system) == 'syniverse':
+        result = Variable.get('manual_run_date')
+        task_instance.xcom_push(key='partitiondatevalue', value=str(result))
+    else:
+        file_value = str(kwargs['file_name'])
+        sql = "SELECT cast(DATE(max(partition_year_month_day)) as string) from `" + project_id + "." + landing_db_name + "." + file_value + "` " \
+              "where cast(DATE(partition_year_month_day) as string) not in (select PARTITION_VAL from `" + project_id + ".vfvrs_dh_lake_bi_reference_data_s.staging_data_load_audit` where SOURCE_TABLE_NAME = '" + file_value + "')"
+        with bq_cursor() as big_query_cursor:
+            logging.info("Running Query: " + sql)
+            big_query_cursor.execute(sql)
+            result = big_query_cursor.fetchone()
+            result1=str(result[0])
+            if result1 == 'None':
+                result2 = '9999-12-31'
+                task_instance.xcom_push(key='partitiondatevalue', value=str(result2))
+            else:
+                task_instance.xcom_push(key='partitiondatevalue', value=result1)
+    print("date fetched:" + str(result))
+
+
+def fetch_count(**kwargs):
+    task_instance = kwargs['ti']
+    file_value = str(kwargs['file_name'])
+    sql1 = "SELECT cast(count(*) as string) from `" + project_id + "." + database_name + "." + file_value +"`"
+    sql2 = "SELECT cast(count(*) as string) from `" + project_id + "." + database_name + "." + file_value +"_t01`"
+    with bq_cursor() as big_query_cursor1:
+        logging.info("Running Query: " + sql1)
+        big_query_cursor1.execute(sql1)
+        result = big_query_cursor1.fetchone()
+        result1 = result[0]
+        task_instance.xcom_push(key='stagingcount', value=str(result[0]))
+        print("count fetched:" + str(result))
+    with bq_cursor() as big_query_cursor2:
+        logging.info("Running Query: " + sql2)
+        big_query_cursor2.execute(sql2)
+        result = big_query_cursor2.fetchone()
+        result2 = result[0]
+        task_instance.xcom_push(key='stagingcount_t01', value=str(result[0]))
+        print("count fetched:" + str(result))
+
+    if result2 > result1:
+        return "load_data_in_staging_table_"+file_value
+    else:
+        return "do_not_load_data_for_"+file_value
+
+def get_audit_details(**kwargs):
+    task_instance = kwargs['ti']
+    file_value = str(kwargs['file_name'])
+    execution_date = str(kwargs['execution_date']).split('+')[0]
+    task_name1= 'load_data_in_staging_table_'+file_value
+    sql1 = "select start_date,end_date,state from task_instance where dag_id = 'Syniverse_Staging_Load' and" \
+           " task_id='" + task_name1 + "' and execution_date='" + execution_date + "'"
+    with db_cursor() as query_cursor:
+        logging.info("Running Query: " + sql1)
+        query_cursor.execute(sql1)
+        result = query_cursor.fetchone()
+        start_date_nbd = str(result[0])
+        end_date_nbd = str(result[1])
+        state_nbd = result[2]
+        task_instance.xcom_push(key='start_date_nbd', value=start_date_nbd)
+        task_instance.xcom_push(key='end_date_nbd', value=end_date_nbd)
+        task_instance.xcom_push(key='state_nbd', value=state_nbd)
+
+
+def get_audit_details_failure(**kwargs):
+    task_instance = kwargs['ti']
+    file_value = str(kwargs['file_name'])
+    execution_date = str(kwargs['execution_date']).split('+')[0]
+    task_name2 = 'do_not_load_data_for_'+file_value
+    sql2 = "select start_date,end_date,state from task_instance where dag_id = 'Syniverse_Staging_Load' and" \
+           " task_id='" + task_name2 + "' and execution_date='" + execution_date + "'"
+    with db_cursor() as query_cursor:
+        logging.info("Running Query: " + sql2)
+        query_cursor.execute(sql2)
+        result = query_cursor.fetchone()
+        start_date_nbd = str(result[0])
+        end_date_nbd = str(result[1])
+        state_nbd = result[2]
+        task_instance.xcom_push(key='start_date', value=start_date_nbd)
+        task_instance.xcom_push(key='end_date', value=end_date_nbd)
+        task_instance.xcom_push(key='state', value=state_nbd)
+
+def get_failed_task_details(**kwargs):
+    task_instance = kwargs['ti']
+    execution_date = str(kwargs['execution_date']).split('+')[0]
+    sql1 = "select count(*) from task_instance where dag_id = 'Syniverse_Staging_Load' and" \
+           " state='failed' and execution_date='" + execution_date + "'"
+    with db_cursor() as query_cursor:
+        logging.info("Running Query: " + sql1)
+        query_cursor.execute(sql1)
+        result = query_cursor.fetchone()
+        count_failed = str(result[0])
+
+    if count_failed != "0":
+        raise AirflowException("Task is failed, please check DAG")
+    else:
+        task_instance.xcom_push(key='count_failed', value=count_failed)
+
+with DAG(
+    'Syniverse_Staging_Load',
+    default_args=default_args,
+    description='DAG FOR Syniverse',
+    start_date=datetime(2022, 3, 21),
+    schedule_interval='0 23 * * *',
+    catchup=False,
+    tags=['example'],
+) as dag:
+    wait_on_merge = IngestionSqlSensor(
+        task_id='wait_on_merge',
+        sql='''
+                (SELECT CASE
+                    WHEN state IN ( 'running', 'failed' ) THEN 0
+                    ELSE 1
+                    end AS poll,
+                    concat("DAG ",dag_id," with execution_date ",execution_date," is in ",state," state.") as log
+                    FROM   dag_run
+                    WHERE  dag_id = "{{ dag.dag_id }}"
+                    AND state IN ( "running", "failed", "success" )
+                    AND execution_date < SUBSTRING_INDEX('{{execution_date}}','+',1)
+                    ORDER  BY execution_date DESC
+                    LIMIT  1)
+                    UNION ALL
+                    (SELECT 1 as poll,'File is being processed for the first time' as log
+                    FROM   (
+                    SELECT count(1) AS count
+                    FROM   dag_run
+                    WHERE  dag_id = "{{ dag.dag_id }}"
+                    AND    execution_date < SUBSTRING_INDEX('{{execution_date}}','+',1))a
+                    WHERE  count=0)
+                ''',
+        conn_id='airflow_db'
+    )
+
+    def get_file_list(**kwargs):
+        print(syn_file_list)
+
+
+    get_file_list = PythonOperator(
+        task_id='get_file_list',
+        provide_context=True,
+        python_callable=get_file_list,
+        dag=dag,
+        trigger_rule='one_success'
+    )
+
+    set_DAG_failure_or_success = PythonOperator(
+        task_id='set_DAG_failure_or_success',
+        provide_context=True,
+        python_callable=get_failed_task_details,
+        dag=dag,
+        trigger_rule='all_done'
+    )
+
+    start_execution = DummyOperator(
+        task_id='start_script_execution',
+        trigger_rule='one_success'
+    )
+
+    trigger_syn_dependent_dashboard_load = TriggerDagRunOperator(
+        task_id='trigger_syn_dependent_dashboard_load',
+        trigger_dag_id='syn_dependent_dashboard_load',
+        provide_context=True,
+        trigger_rule='one_success'
+    )
+
+    # t1, t2 and t3 are examples of tasks created by instantiating operators
+    for each_file in syn_file_list:
+        file_name = str(each_file)
+
+        get_partition_date = PythonOperator(
+            task_id='get_partition_date_for_{file}'.format(file=str(each_file)),
+            python_callable=fetch_date,
+            op_kwargs={"file_name": str(each_file)},
+            provide_context=True,
+            trigger_rule = 'one_success'
+        )
+
+        conditional_move = BranchPythonOperator(
+            task_id='conditional_move_for_{file}'.format(file=str(each_file)),
+            python_callable=fetch_count,
+            op_kwargs={"file_name": str(each_file)},
+            provide_context=True,
+            trigger_rule='one_success'
+        )
+
+        execute_script = BashOperator(
+        task_id='execute_script_for_{file}'.format(file=str(each_file)),
+        bash_command='gsutil cat {bucket}/syniverse_script/{file}_script.sh > '
+                     '{airflow_script_location}/{file}_script.sh ;chmod 744 '
+                     '{airflow_script_location}/{file}_script.sh ;'
+                     'bash {airflow_script_location}/{file}_script.sh {partition_date} {project} '
+                         .format(bucket=Variable.get('gcs_bucket'),file=str(each_file),
+                                 partition_date = "{{task_instance.xcom_pull "
+                                 "(task_ids='" + 'get_partition_date_for_' + str(each_file) + "', key='partitiondatevalue')}}",
+                                 project=str(project_id),
+                                 airflow_script_location=Variable.get('airflow_script_location')),
+        xcom_push=True,
+        trigger_rule='one_success'
+        )
+
+        fetch_audit_details = PythonOperator(
+            task_id='fetch_audit_details_for_{file}'.format(file=str(each_file)),
+            python_callable=get_audit_details,
+            op_kwargs={"file_name": str(each_file)},
+            provide_context=True,
+            trigger_rule='one_success'
+        )
+
+        fetch_audit_details_failure = PythonOperator(
+            task_id='fetch_audit_details_for_failed_{file}'.format(file=str(each_file)),
+            python_callable=get_audit_details_failure,
+            op_kwargs={"file_name": str(each_file)},
+            provide_context=True,
+            trigger_rule='one_success'
+        )
+
+        start_value_nbd = "{{ task_instance.xcom_pull(task_ids='" + 'fetch_audit_details_for_' + str(each_file) + "', key='start_date_nbd')}}"
+        end_value_nbd = "{{ task_instance.xcom_pull(task_ids='" + 'fetch_audit_details_for_' + str(each_file) + "', key='start_date_nbd')}}"
+        start_value = "{{ task_instance.xcom_pull(task_ids='" + 'fetch_audit_details_for_failed_' + str(each_file) + "', key='start_date')}}"
+        end_value = "{{ task_instance.xcom_pull(task_ids='" + 'fetch_audit_details_for_failed_' + str(each_file) + "', key='start_date')}}"
+        job_id_nbd = str("{{ task_instance.xcom_pull(task_ids='" + 'execute_script_for_' + str(each_file) + "') }}")
+        datetime_value = str("{{task_instance.xcom_pull(task_ids='" + 'get_partition_date_for_' + str(each_file) + "', key='partitiondatevalue')}}")
+        target_table=database_name+'.'+str(each_file)
+        status = "{{ task_instance.xcom_pull(task_ids='" + 'fetch_audit_details_for_' + str(each_file) + "',key='state_nbd')}}"
+        stagingcount = "{{ task_instance.xcom_pull(task_ids='" + 'conditional_move_for_' + str(
+            each_file) + "',key='stagingcount')}}"
+        stagingcount_t01 = "{{ task_instance.xcom_pull(task_ids='" + 'conditional_move_for_' + str(
+            each_file) + "',key='stagingcount_t01')}}"
+        log_msg='ERROR : Staging Table Count '+ stagingcount +' is greater than Build table count '+ stagingcount_t01
+
+        create_audit_entry = BigQueryInsertJobOperator(
+            task_id='create_audit_for_{file}'.format(file=str(each_file)),
+            configuration={
+                "query": {
+                    "query": "insert into `" + project_id + ".vfvrs_dh_lake_bi_reference_data_s.staging_data_load_audit`(SOURCE_TABLE_NAME,DAG_NAME,"
+                                                            "DAG_RUN_ID,SCRIPT_LOG,START_DATE_TIME,END_DATE_TIME,TARGET_TABLE_NAME,SOURCE_COUNT,TARGET_COUNT,STATUS,LOGS,PARTITION_VAL) values"
+                                                            "('" + file_name + "','Syniverse_Staging_Load','{{ run_id }}','" + job_id_nbd + "','" + start_value_nbd + "','" +
+                             end_value_nbd + "','" + target_table + "',(select count(1) from `" + project_id + "." + landing_db_name + "."+ file_name +"` where cast(partition_year_month_day as DATE)"
+                                                            "='" + datetime_value+ "'),(select count(1) from `" + project_id + "." + target_table + "`),'"+ status +"','Data is successfully loaded in staging','" + datetime_value +"')",
+                    "useLegacySql": False,
+                }
+            },
+            provide_context=True,
+            xcom_push=True,
+            trigger_rule='one_success'
+        )
+
+
+
+
+        create_audit_entry_count_mismatch = BigQueryInsertJobOperator(
+            task_id='create_audit_failure_for_{file}'.format(file=str(each_file)),
+            configuration={
+                "query": {
+                    "query": "insert into `" + project_id + ".vfvrs_dh_lake_bi_reference_data_s.staging_data_load_audit`(SOURCE_TABLE_NAME,DAG_NAME,"
+                                                    "DAG_RUN_ID,SCRIPT_LOG,START_DATE_TIME,END_DATE_TIME,TARGET_TABLE_NAME,SOURCE_COUNT,TARGET_COUNT,STATUS,LOGS,PARTITION_VAL) values"
+                                                    "('" + file_name + "','Syniverse_Staging_Load','{{ run_id }}','Number of affected rows: 0','" + start_value + "','" +
+                                end_value + "','" + target_table + "',(select count(1) from `" + project_id + "." + landing_db_name + "."+ file_name + "` where cast(partition_year_month_day as DATE)"
+                                                            "='" + datetime_value + "'),(select count(1) from `" + project_id + "." + target_table + "`),'failed','"+ log_msg +"','" + datetime_value +"')",
+                    "useLegacySql": False,
+                }
+            },
+            provide_context=True,
+            xcom_push=True,
+            trigger_rule='one_success'
+        )
+
+        load_data_to_actual_table = BigQueryInsertJobOperator(
+            task_id='load_data_in_staging_table_{file}'.format(file=str(each_file)),
+            configuration={
+                "query": {
+                    "query": "create or replace table `" + project_id + "." + database_name + "."+ file_name + "` as select * from `" + project_id + "." + database_name +"." + file_name + "_t01`",
+                    "useLegacySql": False,
+                }
+            },
+            provide_context=True,
+            xcom_push=True,
+            trigger_rule = 'one_success'
+        )
+
+        success_load = DummyOperator(
+            task_id='success_load_for_{file}'.format(file=str(each_file)),
+            trigger_rule='one_success'
+        )
+
+        do_not_load_data = DummyOperator(
+            task_id='do_not_load_data_for_{file}'.format(file=str(each_file)),
+            trigger_rule='one_success'
+        )
+
+        wait_on_merge >> get_file_list >> start_execution >> get_partition_date >> execute_script >> conditional_move >> load_data_to_actual_table >> success_load >> fetch_audit_details >> create_audit_entry >> set_DAG_failure_or_success >> trigger_syn_dependent_dashboard_load
+        conditional_move >> do_not_load_data >> fetch_audit_details_failure >> create_audit_entry_count_mismatch >> set_DAG_failure_or_success >> trigger_syn_dependent_dashboard_load
+
